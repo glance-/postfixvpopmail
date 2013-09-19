@@ -1,0 +1,305 @@
+#!/usr/bin/perl -T
+#
+# Providing maps from vpopmail to postfix.
+# 
+# Anton Lundin <glance@acc.umu.se>, GPL2+
+#
+
+package postfixvpopmail;
+
+use warnings;
+use strict;
+use Net::Server::Fork;
+#use Data::Dumper;
+
+use vars qw(@ISA);
+@ISA = qw(Net::Server::Fork);
+
+$ENV{'PATH'} = '';
+$SIG{CHLD} = 'IGNORE';
+my $path = '/var/lib/vpopmail/bin';
+
+# regexps used more than one time..
+my $domain_regexp = "[A-Z0-9.-]+\.[A-Z]{2,4}";
+my $email_regexp = "[A-Z0-9.=_%+-]+\@$domain_regexp";
+# valid ezmlm extentions.
+my $ezmlm_regexp = "-faq\@|-help\@|-info\@|-get.*\@|-index.*\@|-thread.*\@|-subscribe.*\@|-unsubscribe.*\@|-list\@|-return.*\@|-edit\..*\@|-log\..*\@|-sc\..*\@|-uc\..*\@|-tc\..*\@|-ed\..*\@";
+
+sub valias($$) {
+	my ($self,$req) = @_;
+	my $pid = open(A, "-|", "$path/valias", "-s", "--", $req);
+	die "valias: $!" unless(defined $pid && kill(0,$pid));
+
+	my @ans;
+	my $linewrap = "";
+	while (my $a = <A>) {
+		$a =~ s/^.+ -> [&]{0,1}(.+)\n$/$1/;
+
+		# god, o why. stupid vpoplib linewraps at 159 chars.
+		# vpalias.c valias_select_all_next , #define MAX_ALIAS_LINE     160
+		if (length($a) == 159) {
+			$linewrap .= $a;
+			next;
+		} elsif ( $linewrap ne "" ) {
+			$linewrap .= $a;
+			$a = $linewrap;
+			$linewrap = "";
+		}
+		push @ans,$a;
+	}
+	close(A);
+	return ($?, \@ans);
+}
+
+sub do_alias($$) {
+	my ($self,$req) = @_;
+
+	return ("500", "do_alias: not email: $req") unless ($req =~ m/^$email_regexp$/i);
+	$self->log(3, "processing do_alias: $req");
+
+	my ($exit_code, $ans) = valias($self,$req);
+
+	if ($exit_code == 0) {
+		# validate that @ans only contains emails, and no ezmlm or other pipes.
+		foreach my $a ( @{$ans} ) {
+		        if ( $a !~ m/^$email_regexp$/i ) {
+		    	    #$self->log(3, "do_alias: alias from $req to $a , and \$a is not a valid email");
+		    	    return ("500","do_alias: alias to non email");
+		        }
+		}
+		return ("200", join(',',@{$ans}));
+	} else {
+		return ("500","valias exit: $exit_code");
+	}
+}
+
+sub do_user($$) {
+	my ($self,$req) = @_;
+
+	return ("500", "do_user: not email: $req") unless ($req =~ m/^$email_regexp$/i);
+	$self->log(3, "processing do_user: $req");
+
+	my $pid = open(A, "-|", "$path/vuserinfo", "--", $req);
+	die "vuserinfo: $!" unless(defined $pid && kill(0,$pid));
+
+	my %ans;
+	while (my $a = <A>) {
+		my ($val,$key) = split(/:[\t ]*/,$a);
+		$ans{$val} = $key;
+		$ans{$val} =~ s/[\r\n]{0,2}$// if defined $ans{$val};
+
+	}
+	close(A);
+
+	if ($? == 0) {
+		# /Maildir/-part is from qmails defaultdelivery.
+		return ("200",$ans{'dir'}."/Maildir/");
+	} else {
+		return ("500","vuserinfo exit: $?");
+	}
+}
+
+sub do_domain($$) {
+	my ($self,$req) = @_;
+
+	return ("500", "do_domain: not domain: $req") unless ($req =~ m/^$domain_regexp$/i); 
+	$self->log(3, "processing do_domain: $req");
+
+	my $pid = open(A, "-|", "$path/vdominfo", "--", $req);
+	die "vdominfo: $!" unless(defined $pid && kill(0,$pid));
+
+	my %ans;
+	while (my $a = <A>) {
+		my ($val,$key) = split(/:[\t ]*/,$a);
+		$ans{$val} = $key;
+		$ans{$val} =~ s/[\r\n]{0,2}$// if defined $ans{$val};
+	}
+	close(A);
+
+	if ($? == 0) {
+		$ans{'domain'} =~ s/ \(alias of $domain_regexp\)$//i;
+		return ("200", $ans{'domain'});
+	} else {
+		return ("500","vdominfo exit: $?");
+	}
+}
+
+sub do_ezmlm($$) {
+	my ($self,$req) = @_;
+
+	return ("500", "do_ezmlm: not ezmlm: $req") unless ($req =~ m/$ezmlm_regexp/i );
+	$self->log(3, "processing do_ezmlm: $req");
+	
+	# remove the ezmlm adress extention.
+	$req =~ s/$ezmlm_regexp/\@/i;
+
+	my ($exit_code, $ans) = valias($self,$req);
+
+	# colaps to a easly matchable string. TODO: maybee foreach and validate...
+	my $msg = join(',', @{$ans});
+	if ($exit_code == 0 && $msg =~ m/ezmlm/) {
+		return ("200", $msg);
+	} else {
+		return ("500", "do_ezmlm: not ezmlm alias");
+	}
+}
+
+sub do_pipe($$) {
+	my ($self,$req) = @_;
+
+	return ("500", "do_pipe: not email: $req") unless ($req =~ m/^$email_regexp$/i);
+	$self->log(3, "processing do_pipe: $req");
+
+	my ($exit_code, $ans) = valias($self,$req);
+
+	if ($exit_code == 0) {
+		# just warn for now, and let anything pass.
+		# alias should already bin processed by postfix and do_alias.
+		# anyhow, its just a passtrue to qmail.
+		foreach my $a ( @{$ans} ) {
+			if ( $a !~ m/^\|/ ) {
+				$self->log(3, " do_pipe: req = $req, a = $a doesnt look like a pipe..");
+			}
+		}
+		return ("200", join(',', @{$ans}));
+	} else {
+		return ("500", "do_pipe: not pipe alias");
+	}
+}
+
+sub process_request($) {
+	my $self = shift;
+	
+	while (my $req = <STDIN>) {
+		eval {
+			local $SIG{'ALRM'} = sub { die "Timed Out!" };
+			alarm(30); # give 30 seconds to type some lines
+
+			$req =~ s/^get (.+)$/$1/;
+			$req =~ s/[\r\n]{0,2}$// if defined $req;
+
+			my ($code,$answer);
+			if ($$self{'server'}{'sockport'} == 2345) { #alias
+				($code,$answer) = do_alias($self, $req);
+			} elsif ($$self{'server'}{'sockport'} == 2346) { #user
+				($code,$answer) = do_user($self, $req);
+			} elsif ($$self{'server'}{'sockport'} == 2347) { #domain
+				($code,$answer) = do_domain($self, $req);
+			} elsif ($$self{'server'}{'sockport'} == 2348) { #ezmlm
+				($code,$answer) = do_ezmlm($self, $req);
+			} elsif ($$self{'server'}{'sockport'} == 2349) { #ezmlm
+				($code,$answer) = do_pipe($self, $req);
+			}
+			$self->log(3, "$code $answer");
+			# FIXME should be a more general function that excapes all
+			$answer =~ s/ /%20/g;
+			$answer =~ s/\n/%0A/g;
+			$answer =~ s/\r/%0D/g;
+			print STDOUT "$code $answer\r\n";
+			alarm(0);
+		};
+		if ($@) {
+			$self->log(3, "400 $@");
+			# FIXME
+			$@ =~ s/ /%20/g;
+			$@ =~ s/\n/%0A/g;
+			$@ =~ s/\r/%0D/g;
+			print STDOUT "400 $@\r\n";
+		}
+	}
+	$self->log(1,"done with connection");
+}
+
+sub server_close($) {
+	my $self = shift;
+	$self->log(1,"server shuting down");
+	$self->SUPER::server_close;
+}
+
+##########################
+########## MAIN ##########
+##########################
+
+if (defined $ARGV[0] && $ARGV[0] eq 'start') {
+	print STDOUT "postfixvpopmail starting\n";
+	postfixvpopmail->run(
+		'syslog_ident'	=>	'postfixvpopmail',
+#		'log_file'	=>	"/tmp/postfixvpopmail.$$",
+		'log_file'	=>	'Sys::Syslog',
+		'syslog_facility'	=>	'local0',
+		'log_level'	=>	3,
+		'user'		=>	'vpopmail',
+		'group'		=>	'vchkpw',
+		'port'		=>	[2345,2346,2347,2348,2349], # alias, user, domain, ezmlm, pipe
+		'host'		=>	'127.0.0.1',
+		'background'	=>	1,
+		'setsid'	=>	1,
+		'pid_file'	=>	"/var/run/postfixvpopmail.pid",
+	);
+} elsif (defined $ARGV[0] && $ARGV[0] eq 'stop') {
+	open(PID,"<","/var/run/postfixvpopmail.pid")|| die("no pid file found: $!");
+	my $pid = <PID>;
+	close(PID);
+
+	$pid =~ /^(\d+)/;
+	$pid = $1;
+
+	kill(15,$pid);
+	waitpid($pid,0);
+
+	unlink("/var/run/postfixvpopmail.pid");
+	print STDOUT "postfixvpopmail quited with status $?\n";
+} elsif (defined $ARGV[0] && $ARGV[0] eq 'restart') {
+	# Darn tainting.
+	$0 =~ m/^(.+)$/;
+	system($1,"stop");
+	system($1,"start");
+} else {
+	print STDOUT "usage: $0 (start|stop|restart)\n";
+}
+
+1;
+
+=cut
+REQUEST FORMAT
+	Each request specifies a command, a lookup key, and possi-
+	bly a lookup result.
+
+	get SPACE key NEWLINE
+		Look up data under the specified key.
+
+	put SPACE key SPACE value NEWLINE
+		This request is currently not implemented.
+
+REPLY FORMAT
+	Each reply specifies a status code and text. Replies must
+	be no longer than 4096 characters including the newline
+	terminator.
+
+	500 SPACE text NEWLINE
+		In case of a lookup request, the requested data
+		does not exist. In case of an update request, the
+		request was rejected. The text describes the
+		nature of the problem.
+
+	400 SPACE text NEWLINE
+		This indicates an error condition. The text
+		describes the nature of the problem. The client
+		should retry the request later.
+
+	200 SPACE text NEWLINE
+		The request was successful. In the case of a lookup
+		request, the text contains an encoded version of
+		the requested data.
+
+ENCODING
+	In request and reply parameters, the character %, each 
+	non-printing character, and each whitespace character must be 
+	replaced by %XX, where XX is the corresponding ASCII hexadecimal
+	character value. The hexadecimal codes can be specified in 
+	any case (upper, lower, mixed).
+
+	The Postfix client always encodes a request. The server may omit 
+	the encoding as long as the reply is guaranteed to not contain 
+	the % or NEWLINE character.
+=cut
